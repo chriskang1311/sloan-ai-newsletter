@@ -25,6 +25,23 @@ from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import requests
 
+# Common words that carry no topic signal — excluded from topic fingerprints
+STOPWORDS = frozenset({
+    "a", "an", "the", "is", "are", "was", "were", "has", "have", "had",
+    "be", "been", "being", "this", "that", "these", "those", "it", "its",
+    "for", "in", "on", "at", "to", "from", "with", "by", "of", "and",
+    "or", "but", "not", "vs", "after", "before", "as", "about", "into",
+    "over", "under", "out", "will", "can", "could", "would", "should",
+    "may", "might", "do", "does", "did", "get", "gets", "got",
+    "make", "makes", "made", "says", "said", "reports", "report",
+    "new", "now", "just", "more", "than", "so", "up", "here", "there",
+    "also", "even", "only", "very", "much", "many", "most", "all",
+    "how", "why", "what", "when", "where", "who", "which",
+    "our", "your", "their", "one", "two", "three",
+    "year", "years", "week", "weeks", "day", "days", "time",
+    "way", "use", "used", "using", "company", "companies",
+})
+
 RSS_FEEDS = [
     "https://techcrunch.com/category/artificial-intelligence/feed/",
     "https://www.technologyreview.com/feed/",
@@ -118,8 +135,8 @@ def fetch_newsapi_articles(
     api_key: str,
     query: str = NEWSAPI_QUERY,
     domains: str = NEWSAPI_DOMAINS,
-    page_size: int = 20,
-    lookback_days: int = 7,
+    page_size: int = 30,
+    lookback_days: int = 6,
 ) -> list[Article]:
     """
     Calls NewsAPI /v2/everything endpoint restricted to AI-focused domains.
@@ -181,11 +198,13 @@ def fetch_newsapi_articles(
 
 def fetch_rss_articles(
     feed_urls: list[str] = RSS_FEEDS,
-    max_per_feed: int = 4,
+    max_per_feed: int = 8,
+    lookback_days: int = 6,
 ) -> list[Article]:
     """
     Fetches and parses RSS feeds. Uses requests for timeout control,
     then passes content to feedparser.
+    Only returns articles published within the last lookback_days days.
     """
     try:
         import feedparser
@@ -193,6 +212,7 @@ def fetch_rss_articles(
         print("WARNING: feedparser not installed. Skipping RSS feeds.")
         return []
 
+    cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
     articles = []
     headers = {"User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)"}
 
@@ -229,13 +249,26 @@ def fetch_rss_articles(
             if not title or not url_val:
                 continue
 
+            published_at = _parse_date(published_raw)
+
+            # Skip articles older than the lookback window
+            try:
+                from dateutil import parser as dateutil_parser
+                pub_dt = dateutil_parser.parse(published_at)
+                if pub_dt.tzinfo is None:
+                    pub_dt = pub_dt.replace(tzinfo=timezone.utc)
+                if pub_dt < cutoff:
+                    continue
+            except Exception:
+                pass  # If date parsing fails, include the article anyway
+
             source = feed.feed.get("title", urlparse(feed_url).netloc)
 
             article = Article(
                 title=title,
                 url=url_val,
                 source=source,
-                published_at=_parse_date(published_raw),
+                published_at=published_at,
                 description=description[:500],
                 category_hint="unknown",
             )
@@ -245,11 +278,39 @@ def fetch_rss_articles(
     return articles
 
 
+def _keyword_set(title: str) -> frozenset:
+    """
+    Extracts significant keywords from an article title for topic comparison.
+    Returns only lowercase alpha words of length >= 4 that are not stopwords.
+    """
+    words = re.findall(r'\b[a-z][a-z]{2,}\b', title.lower())
+    return frozenset(w for w in words if w not in STOPWORDS)
+
+
+def _same_topic(title1: str, title2: str, threshold: float = 0.45) -> bool:
+    """
+    Returns True if two article titles appear to cover the same news event.
+    Uses overlap coefficient: shared keywords / size of smaller keyword set.
+    Requires at least 2 keywords in each title to avoid spurious matches.
+    """
+    kw1 = _keyword_set(title1)
+    kw2 = _keyword_set(title2)
+    min_size = min(len(kw1), len(kw2))
+    if min_size < 2:
+        return False
+    overlap = len(kw1 & kw2)
+    return (overlap / min_size) >= threshold
+
+
 def _deduplicate(articles: list[Article]) -> list[Article]:
     """
-    Removes duplicate articles by:
+    Removes duplicate articles using three checks (in order):
     1. Exact URL match (after stripping UTM params)
-    2. Title similarity >= 0.85 (difflib)
+    2. Title string similarity >= 0.85 (difflib) — catches near-identical rewrites
+    3. Topic keyword overlap >= 45% — catches different-source articles about the same event
+
+    Articles are processed in order; the first (highest-priority) article is kept.
+    NewsAPI articles are prepended before RSS, so they win ties.
     """
     seen_urls: set[str] = set()
     seen_titles: list[str] = []
@@ -267,6 +328,13 @@ def _deduplicate(articles: list[Article]) -> list[Article]:
         if is_dup_title:
             continue
 
+        is_dup_topic = any(
+            _same_topic(article.title, seen)
+            for seen in seen_titles
+        )
+        if is_dup_topic:
+            continue
+
         seen_urls.add(clean_url)
         seen_titles.append(article.title)
         unique.append(article)
@@ -276,23 +344,29 @@ def _deduplicate(articles: list[Article]) -> list[Article]:
 
 def scrape_news(
     newsapi_key: str,
-    target_article_count: int = 15,
+    target_article_count: int = 30,
+    lookback_days: int = 6,
 ) -> list[dict]:
     """
     Main entry point. Fetches from NewsAPI + RSS feeds, deduplicates,
     sorts by date descending, returns as list of JSON-serializable dicts.
 
+    lookback_days: how far back to look for articles (default 6 days).
+    target_article_count: number of articles to return after dedup (default 30).
+
     Raises ValueError if fewer than 6 articles are found (not enough for newsletter).
     """
+    print(f"Fetching articles from the past {lookback_days} days...", flush=True)
     print("Fetching articles from NewsAPI...", flush=True)
     newsapi_articles = fetch_newsapi_articles(
         api_key=newsapi_key,
         page_size=target_article_count,
+        lookback_days=lookback_days,
     )
     print(f"  NewsAPI: {len(newsapi_articles)} articles", flush=True)
 
     print("Fetching articles from RSS feeds...", flush=True)
-    rss_articles = fetch_rss_articles(RSS_FEEDS, max_per_feed=4)
+    rss_articles = fetch_rss_articles(RSS_FEEDS, max_per_feed=8, lookback_days=lookback_days)
     print(f"  RSS feeds: {len(rss_articles)} articles", flush=True)
 
     # Combine: NewsAPI first (generally higher quality), then RSS

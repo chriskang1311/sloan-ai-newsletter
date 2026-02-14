@@ -86,7 +86,7 @@ def send_weekly_newsletter() -> None:
 
     # Step 1: Scrape news
     print("\n[1/3] Scraping news articles...", flush=True)
-    articles = scrape_news(newsapi_key=newsapi_key, target_article_count=15)
+    articles = scrape_news(newsapi_key=newsapi_key, target_article_count=30, lookback_days=6)
     print(f"      Found {len(articles)} articles to work with.", flush=True)
 
     # Step 2: Generate newsletter

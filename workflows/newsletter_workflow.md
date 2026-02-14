@@ -21,13 +21,14 @@ All stored in Modal under secret name `newsletter-secrets` AND mirrored in `.env
 
 ```
 1. tools/scrape_news.py
-   - Fetches up to 15 articles from NewsAPI + 5 RSS feeds
-   - Deduplicates by URL and title similarity
+   - Fetches up to 30 articles from the past 6 days via NewsAPI + 5 RSS feeds
+   - Three-layer deduplication: exact URL match → title similarity (0.85) → topic keyword overlap (0.45 coefficient)
+   - Topic overlap catches different-source articles reporting on the same event
    - Returns list of article dicts sorted by date (newest first)
    - Raises ValueError if fewer than 6 articles found
 
 2. tools/generate_newsletter.py
-   - Claude call 1: Categorizes articles into gossip vs builders sections
+   - Claude call 1: Categorizes articles into gossip vs builders sections; explicitly avoids selecting two articles covering the same event
    - Claude call 2: Generates AI Gossip section content (summary, bullets, coffee chat tip)
    - Claude call 3: Generates AI Builders section content (summary, bullets, coffee chat tip)
    - Claude call 4: Generates 1-sentence overall blurb
@@ -96,7 +97,7 @@ Verify the schedule in Modal dashboard > Apps > sloan-ai-newsletter > Schedule t
 Before relying on the Wednesday cron, verify each component:
 
 ```bash
-# 1. Test scraper (should print 15 articles)
+# 1. Test scraper (should print ~20-30 articles from the past 6 days)
 python tools/scrape_news.py
 
 # 2. Test newsletter generation (writes .tmp/newsletter_preview.html)

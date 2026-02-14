@@ -168,8 +168,10 @@ Select the best articles for two newsletter sections:
 Rules:
 - Select exactly 3 articles per section (the 3 strongest, most MBA-relevant)
 - Each article can only appear in ONE section
+- No two selected articles across EITHER section may cover the same event or announcement — even if they come from different sources. If multiple articles report on the same story (e.g., two articles about the same funding round or the same model release), pick only the single best one
 - Skip articles that are not clearly about AI/tech — no sports, entertainment, or off-topic pieces
-- Prioritize recency and business relevance for an MBA audience
+- Prioritize recency, newsworthiness, and business relevance for an MBA audience
+- Maximize diversity of topics across your final 6 selections
 
 Return JSON in this exact format:
 {{
