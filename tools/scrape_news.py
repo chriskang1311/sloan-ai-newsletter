@@ -72,10 +72,16 @@ GOSSIP_KEYWORDS = [
 ]
 
 BUILDERS_KEYWORDS = [
-    "startup", "funding", "raises", "raised", "series a", "series b", "series c",
-    "seed", "launch", "launched", "tool", "platform", "open-source", "open source",
-    "api", "release", "released", "product", "app", "model", "framework",
-    "developer", "founder", "venture", "vc", "investment", "backed",
+    "startup", "funding", "raises", "raised", "series a", "series b",
+    "seed", "seed round", "pre-seed", "launch", "launched", "tool", "platform",
+    "open-source", "open source", "api", "release", "released", "product", "app",
+    "model", "framework", "developer", "founder", "venture", "vc", "investment", "backed",
+]
+
+# Late-stage or non-startup signals — articles with these terms are penalized in builders scoring
+BUILDERS_LATE_STAGE_TERMS = [
+    "series c", "series d", "series e", "series f", "ipo", "public offering",
+    "acquisition", "merger", "went public",
 ]
 
 
@@ -116,10 +122,15 @@ def assign_category_hint(article: Article) -> Article:
     """
     Keyword heuristic to pre-label articles before Claude sees them.
     Claude makes the final categorization decision.
+    Late-stage funding terms (Series C+, IPO) reduce the builders score.
     """
     text = (article.title + " " + article.description).lower()
     gossip_score = sum(1 for kw in GOSSIP_KEYWORDS if kw in text)
     builders_score = sum(1 for kw in BUILDERS_KEYWORDS if kw in text)
+
+    # Penalize late-stage or non-startup content from the builders category
+    if any(term in text for term in BUILDERS_LATE_STAGE_TERMS):
+        builders_score -= 2
 
     if gossip_score > builders_score:
         article.category_hint = "gossip"
