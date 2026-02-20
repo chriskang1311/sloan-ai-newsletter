@@ -158,12 +158,20 @@ def categorize_and_select_articles(client, articles: list) -> tuple:
 Select the best articles for two newsletter sections:
 
 1. "AI Gossip: Hot Takes & Hallucinations" — Big tech company moves, executive drama,
-   regulatory news, model releases from OpenAI/Google/Meta/Anthropic/Microsoft/Nvidia.
-   Think: what MBAs will gossip about at networking events.
+   regulatory battles, CEO controversies, lawsuits, and major announcements from
+   OpenAI/Google/Meta/Anthropic/Microsoft/Nvidia/Apple.
+   PRIORITIZE stories that are widely covered, surprising, controversial, or involve power
+   plays — the juiciest, most conversation-worthy headlines that people will ACTUALLY bring
+   up at networking events and in the hallways this week. Think: what will everyone be
+   talking about, not just what is technically significant.
 
-2. "AI Builders: Startups You'll Pretend You Already Knew About" — Startup funding rounds,
-   new AI tools, product launches, open-source releases, developer ecosystem news.
-   Think: what founders and VCs are actually building this week.
+2. "AI Builders: Startups You'll Pretend You Already Knew About" — EARLY-STAGE AI startup
+   news only: Seed, Series A, or Series B funding rounds, early-stage product launches,
+   and open-source releases from young startups.
+   CRITICAL: Do NOT select Series C or later rounds, IPOs, or news about established tech
+   companies (Google, Microsoft, Meta, Apple, Amazon, OpenAI, Anthropic, etc.). If you are
+   unsure about funding stage, exclude the article. Leave builders_indices shorter than 3
+   rather than include an ineligible article.
 
 Rules:
 - Select exactly 3 articles per section (the 3 strongest, most MBA-relevant)
@@ -172,6 +180,7 @@ Rules:
 - Skip articles that are not clearly about AI/tech — no sports, entertainment, or off-topic pieces
 - Prioritize recency, newsworthiness, and business relevance for an MBA audience
 - Maximize diversity of topics across your final 6 selections
+- For BUILDERS: this is a hard constraint — only early-stage startups (Seed/A/B). No exceptions.
 
 Return JSON in this exact format:
 {{
@@ -208,7 +217,23 @@ def generate_section_stories(client, section_name: str, articles: list) -> Newsl
     """
     articles_text = _format_articles_for_prompt(articles)
 
+    if "Gossip" in section_name:
+        section_guidance = """GOSSIP SECTION GUIDANCE:
+- These are the stories everyone will be talking about this week. Write them accordingly.
+- Headlines should feel urgent and shareable — like something you'd text a friend: "did you see this?!"
+- Lean into the drama and power dynamics where they're real. Don't shy away from naming names.
+- Sound-smart tips should give the reader something they can actually drop in conversation:
+  the real-world implications for careers, investment, or competitive positioning."""
+    else:
+        section_guidance = """BUILDERS SECTION GUIDANCE:
+- All articles in this section are about early-stage AI startups (Seed, Series A, or Series B).
+- Emphasize the "why now": what market gap is this startup targeting, and why does it matter?
+- Sound-smart tips should help the reader explain what this startup does and why smart money is backing it.
+- Highlight the founding vision or unique technical angle where relevant."""
+
     user_prompt = f"""You are writing the "{section_name}" section of this week's AI News for Sloanies newsletter.
+
+{section_guidance}
 
 You have {len(articles)} articles:
 {articles_text}
@@ -492,8 +517,11 @@ def build_html_email(content: NewsletterContent, logo_data_uri: str = "") -> str
               <p style="margin: 0 0 6px 0; font-size: 13px; color: #a0a8c8; font-family: Arial, Helvetica, sans-serif;">
                 <strong style="color: #ffffff;">AI News for Sloanies</strong> &bull; MIT Sloan School of Management
               </p>
-              <p style="margin: 0; font-size: 11px; color: #4a4d6a; font-family: Arial, Helvetica, sans-serif;">
+              <p style="margin: 0 0 8px 0; font-size: 11px; color: #4a4d6a; font-family: Arial, Helvetica, sans-serif;">
                 Powered by Claude &bull; Delivered every Wednesday at 8am ET
+              </p>
+              <p style="margin: 0; font-size: 10px; color: #3a3d5a; font-family: Arial, Helvetica, sans-serif; line-height: 1.5;">
+                This newsletter aggregates top AI news from the past week and uses AI to assist in generating its content.
               </p>
             </td>
           </tr>
