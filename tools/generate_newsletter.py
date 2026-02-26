@@ -146,7 +146,7 @@ def _format_articles_for_prompt(articles: list) -> str:
     return "\n\n".join(lines)
 
 
-def categorize_and_select_articles(client, articles: list) -> tuple:
+def categorize_and_select_articles(client, articles: list, persona: str = NEWSLETTER_PERSONA) -> tuple:
     """
     Assigns articles to gossip vs builders sections.
     Returns (gossip_articles, builders_articles).
@@ -191,8 +191,8 @@ Return JSON in this exact format:
 Articles:
 {articles_text}"""
 
-    raw = _call_claude_with_retry(client, NEWSLETTER_PERSONA, user_prompt)
-    parsed = _parse_json_response(raw, user_prompt, client, NEWSLETTER_PERSONA)
+    raw = _call_claude_with_retry(client, persona, user_prompt)
+    parsed = _parse_json_response(raw, user_prompt, client, persona)
 
     gossip_indices = parsed.get("gossip_indices", [])
     builders_indices = parsed.get("builders_indices", [])
@@ -210,7 +210,7 @@ Articles:
     return gossip_articles, builders_articles
 
 
-def generate_section_stories(client, section_name: str, articles: list) -> NewsletterSection:
+def generate_section_stories(client, section_name: str, articles: list, persona: str = NEWSLETTER_PERSONA) -> NewsletterSection:
     """
     Generates per-story content for one section.
     Each story: headline, summary, The Deets (3-4 bullets), How you can sound smart.
@@ -282,8 +282,8 @@ Return a JSON object with a "stories" array:
 
 Write all {len(articles)} stories. Return ONLY the JSON."""
 
-    raw = _call_claude_with_retry(client, NEWSLETTER_PERSONA, user_prompt)
-    parsed = _parse_json_response(raw, user_prompt, client, NEWSLETTER_PERSONA)
+    raw = _call_claude_with_retry(client, persona, user_prompt)
+    parsed = _parse_json_response(raw, user_prompt, client, persona)
 
     stories = parsed.get("stories", [])
     if not stories:
@@ -297,6 +297,7 @@ def generate_opening_and_subject(
     gossip_articles: list,
     builders_articles: list,
     monday_date: str,
+    persona: str = NEWSLETTER_PERSONA,
 ) -> tuple:
     """
     Generates the subject line, "Hello Sloanies!" greeting, and top story teasers.
@@ -328,8 +329,8 @@ Return JSON:
   "story_teasers": ["...", "...", "..."]
 }}"""
 
-    raw = _call_claude_with_retry(client, NEWSLETTER_PERSONA, user_prompt)
-    parsed = _parse_json_response(raw, user_prompt, client, NEWSLETTER_PERSONA)
+    raw = _call_claude_with_retry(client, persona, user_prompt)
+    parsed = _parse_json_response(raw, user_prompt, client, persona)
 
     subject_line = parsed.get("subject_line", f"AI News for Sloanies | Week of {monday_date}")
     greeting_finish = parsed.get("greeting_finish", "this week in AI did not disappoint.")
@@ -511,6 +512,21 @@ def build_html_email(content: NewsletterContent, logo_data_uri: str = "") -> str
             </td>
           </tr>
 
+          <!-- DISCLAIMER -->
+          <tr>
+            <td style="padding: 0 30px 24px 30px;">
+              <table width="100%" cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td style="background-color: #f7f8fc; border: 1px solid #dde2ec; border-radius: 4px; padding: 14px 18px; text-align: center;">
+                    <p style="margin: 0; font-size: 13px; color: #555; font-family: Arial, Helvetica, sans-serif; line-height: 1.7; font-style: italic;">
+                      This newsletter aggregates top AI news from the past week and uses AI to assist in generating its content. Always verify important information with primary sources before acting on it.
+                    </p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
           <!-- FOOTER -->
           <tr>
             <td style="background-color: #1a1a2e; padding: 20px 30px; text-align: center;">
@@ -520,8 +536,8 @@ def build_html_email(content: NewsletterContent, logo_data_uri: str = "") -> str
               <p style="margin: 0 0 8px 0; font-size: 11px; color: #4a4d6a; font-family: Arial, Helvetica, sans-serif;">
                 Powered by Claude &bull; Delivered every Wednesday at 8am ET
               </p>
-              <p style="margin: 0; font-size: 10px; color: #3a3d5a; font-family: Arial, Helvetica, sans-serif; line-height: 1.5;">
-                This newsletter aggregates top AI news from the past week and uses AI to assist in generating its content.
+              <p style="margin: 0; font-size: 11px; color: #4a4d6a; font-family: Arial, Helvetica, sans-serif;">
+                To unsubscribe, reply to this email with &ldquo;Unsubscribe&rdquo; in the subject line.
               </p>
             </td>
           </tr>
@@ -541,11 +557,13 @@ def generate_newsletter(
     anthropic_api_key: str,
     articles: list,
     logo_path: str = "ai_club_logo.jpg",
+    reviewer_feedback: str = "",
 ) -> tuple:
     """
     Main entry point. Orchestrates all Claude calls and builds the HTML email.
     Returns (html_string, subject_line).
     logo_path: path to the logo file (relative or absolute).
+    reviewer_feedback: optional feedback from a reviewer to guide regeneration.
     """
     try:
         import anthropic
@@ -560,19 +578,32 @@ def generate_newsletter(
     else:
         print(f"  WARNING: Logo not found at '{logo_path}'. Header will show without logo.", flush=True)
 
+    # Build effective system prompt — incorporate reviewer feedback when regenerating
+    if reviewer_feedback:
+        effective_persona = (
+            NEWSLETTER_PERSONA
+            + "\n\nREVIEWER FEEDBACK FROM PREVIOUS DRAFT:\n"
+            "The reviewer of the previous newsletter draft requested the following changes. "
+            "Incorporate this feedback throughout all of your article selection, writing, and framing:\n"
+            f"{reviewer_feedback}"
+        )
+        print(f"  Using reviewer feedback: {reviewer_feedback[:120]}{'...' if len(reviewer_feedback) > 120 else ''}", flush=True)
+    else:
+        effective_persona = NEWSLETTER_PERSONA
+
     print("Categorizing articles with Claude...", flush=True)
-    gossip_articles, builders_articles = categorize_and_select_articles(client, articles)
+    gossip_articles, builders_articles = categorize_and_select_articles(client, articles, persona=effective_persona)
     print(f"  Gossip: {len(gossip_articles)} articles | Builders: {len(builders_articles)} articles", flush=True)
 
     print("Generating AI Gossip stories...", flush=True)
-    gossip_section = generate_section_stories(client, "AI Gossip: Hot Takes & Hallucinations", gossip_articles)
+    gossip_section = generate_section_stories(client, "AI Gossip: Hot Takes & Hallucinations", gossip_articles, persona=effective_persona)
 
     print("Generating AI Builders stories...", flush=True)
-    builders_section = generate_section_stories(client, "AI Builders: Startups You'll Pretend You Already Knew About", builders_articles)
+    builders_section = generate_section_stories(client, "AI Builders: Startups You'll Pretend You Already Knew About", builders_articles, persona=effective_persona)
 
     print("Generating subject line and opening...", flush=True)
     subject_line, greeting_finish, story_teasers = generate_opening_and_subject(
-        client, gossip_articles, builders_articles, monday_date
+        client, gossip_articles, builders_articles, monday_date, persona=effective_persona
     )
 
     # Collect sources from all selected articles

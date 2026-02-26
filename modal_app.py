@@ -6,27 +6,44 @@ Two-stage pipeline with human-in-the-loop review:
 
   Stage 1 — generate_and_preview() [runs on cron every Wednesday at 8am ET]:
     - Scrapes news, generates newsletter HTML via Claude
-    - Stores the newsletter in a Modal Dict (persistent cache)
-    - Sends a PREVIEW email to REVIEWER_EMAILS with an "Approve & Send" button
+    - Stores the newsletter (HTML, subject, articles) in a Modal Dict (persistent cache)
+    - Sends a PREVIEW email to REVIEWER_EMAILS with "Approve & Send" and "Request Changes" buttons
 
-  Stage 2 — approve_and_send() [web endpoint, triggered by reviewer clicking the button]:
+  Stage 2a — approve_and_send() [web endpoint, triggered by reviewer clicking "Approve"]:
     - Validates the approval token from the URL
-    - Retrieves the cached newsletter
+    - Retrieves the cached newsletter (idempotent — ignores duplicate clicks)
     - Sends to all RECIPIENT_EMAILS
     - Returns a confirmation page
+
+  Stage 2b — request_changes() [web endpoint, triggered by reviewer clicking "Request Changes"]:
+    - Validates the approval token from the URL
+    - Shows a feedback form when no comments are present
+    - When comments are submitted, stores them in the cache and re-triggers Stage 1
+    - The regenerated newsletter incorporates the reviewer's feedback
 
 Setup:
   1. Install Modal: pip install modal
   2. Authenticate: modal token new
-  3. Create secrets in Modal dashboard:
+  3. Create an App Password for Gmail (no custom domain required):
+       myaccount.google.com → Security → 2-Step Verification (enable if needed)
+       → App passwords → Mail / Other → Generate → copy the 16-char password
+  4. Create secrets in Modal dashboard:
      - Secret name: newsletter-secrets
-     - Keys: NEWSAPI_KEY, ANTHROPIC_API_KEY, GMAIL_CLIENT_ID,
-             GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN, GMAIL_SENDER_EMAIL,
-             RECIPIENT_EMAILS, REVIEWER_EMAILS, APPROVAL_SECRET_TOKEN, WEBHOOK_URL
-  4. Deploy: modal deploy modal_app.py
-  5. After deploying, copy the approve_and_send endpoint URL from Modal dashboard
+     - Required keys:
+         NEWSAPI_KEY, ANTHROPIC_API_KEY
+         GMAIL_SENDER_EMAIL     — your Gmail address (e.g. you@gmail.com)
+         GMAIL_APP_PASSWORD     — the 16-character App Password (no spaces)
+         RECIPIENT_EMAILS       — comma-separated subscriber list
+         REVIEWER_EMAILS        — comma-separated reviewer list
+         APPROVAL_SECRET_TOKEN  — any long random string (acts as a shared secret for button links)
+         WEBHOOK_URL            — approve_and_send endpoint URL (add after step 5)
+     - Optional keys (add after step 5 if Modal changes the auto-derived URLs):
+         DECLINE_WEBHOOK_URL    — request_changes endpoint URL
+         BROWSER_PREVIEW_URL    — browser_preview endpoint URL
+  5. Deploy: modal deploy modal_app.py
+  6. After deploying, copy the approve_and_send endpoint URL from Modal dashboard
      and add it as WEBHOOK_URL in your newsletter-secrets.
-  6. Test Stage 1 manually: modal run modal_app.py
+  7. Test Stage 1 manually: modal run modal_app.py
      Then click the approval link in the preview email to test Stage 2.
 
 Monitoring:
@@ -53,9 +70,6 @@ newsletter_image = (
         "anthropic>=0.40.0",
         "requests>=2.31.0",
         "feedparser>=6.0.11",
-        "google-auth>=2.27.0",
-        "google-auth-oauthlib>=1.2.0",
-        "google-api-python-client>=2.118.0",
         "python-dateutil>=2.9.0",
         "fastapi>=0.100.0",   # Required for web endpoint HTML responses
     ])
@@ -95,23 +109,56 @@ def generate_and_preview() -> None:
     # Read secrets from environment (injected by Modal)
     newsapi_key      = os.environ["NEWSAPI_KEY"]
     anthropic_key    = os.environ["ANTHROPIC_API_KEY"]
-    gmail_client_id  = os.environ["GMAIL_CLIENT_ID"]
-    gmail_secret     = os.environ["GMAIL_CLIENT_SECRET"]
-    gmail_refresh    = os.environ["GMAIL_REFRESH_TOKEN"]
-    sender_email     = os.environ["GMAIL_SENDER_EMAIL"]
+    gmail_sender     = os.environ["GMAIL_SENDER_EMAIL"]
+    gmail_password   = os.environ["GMAIL_APP_PASSWORD"]
     reviewer_emails  = [r.strip() for r in os.environ["REVIEWER_EMAILS"].split(",")]
     webhook_url      = os.environ["WEBHOOK_URL"]
     approval_token   = os.environ["APPROVAL_SECRET_TOKEN"]
+
+    # Endpoint URLs — prefer explicit secrets, fall back to derivation from WEBHOOK_URL.
+    # Modal URL pattern: https://workspace--app-name-function-name.modal.run
+    decline_base_url = (
+        os.environ.get("DECLINE_WEBHOOK_URL")
+        or webhook_url.replace("approve-and-send", "request-changes")
+    )
+    preview_base_url = (
+        os.environ.get("BROWSER_PREVIEW_URL")
+        or webhook_url.replace("approve-and-send", "browser-preview")
+    )
 
     print("=" * 55, flush=True)
     print(f"AI for Sloanies — {datetime.now().strftime('%B %d, %Y')}", flush=True)
     print("STAGE 1: Generating newsletter and sending preview", flush=True)
     print("=" * 55, flush=True)
 
-    # Step 1: Scrape news
-    print("\n[1/4] Scraping news articles...", flush=True)
-    articles = scrape_news(newsapi_key=newsapi_key, target_article_count=30, lookback_days=6)
-    print(f"      Found {len(articles)} articles to work with.", flush=True)
+    # Check for reviewer feedback from a previous decline
+    reviewer_feedback = newsletter_cache.get("feedback", "")
+    if reviewer_feedback:
+        print(f"\n  Reviewer feedback found. Will incorporate into generation.", flush=True)
+        try:
+            del newsletter_cache["feedback"]
+        except KeyError:
+            pass
+    else:
+        # Fresh cron run — reset the revision counter so the reviewer gets a clean slate
+        try:
+            del newsletter_cache["revision_count"]
+        except KeyError:
+            pass
+
+    # Step 1: Scrape news (or reuse cached articles on a feedback-triggered re-run)
+    print("\n[1/4] Scraping / loading articles...", flush=True)
+    if reviewer_feedback:
+        prior = newsletter_cache.get("latest", {})
+        articles = prior.get("articles", [])
+        if articles:
+            print(f"      Reusing {len(articles)} cached articles from previous run.", flush=True)
+        else:
+            print("      No cached articles found — scraping fresh.", flush=True)
+            articles = scrape_news(newsapi_key=newsapi_key, target_article_count=30, lookback_days=6)
+    else:
+        articles = scrape_news(newsapi_key=newsapi_key, target_article_count=30, lookback_days=6)
+    print(f"      {len(articles)} articles ready.", flush=True)
 
     # Step 2: Generate newsletter
     print("\n[2/4] Generating newsletter with Claude...", flush=True)
@@ -119,40 +166,55 @@ def generate_and_preview() -> None:
         anthropic_api_key=anthropic_key,
         articles=articles,
         logo_path="/app/ai_club_logo.jpg",
+        reviewer_feedback=reviewer_feedback,
     )
     print(f"      Newsletter generated ({len(html_body):,} bytes of HTML).", flush=True)
     print(f"      Subject: {subject}", flush=True)
 
-    # Step 3: Cache newsletter for the approval step
+    # Step 3: Cache newsletter + articles for the approval step (reset sent flag)
     print("\n[3/4] Caching newsletter for approval...", flush=True)
-    newsletter_cache["latest"] = {"html": html_body, "subject": subject}
+    newsletter_cache["latest"] = {
+        "html": html_body,
+        "subject": subject,
+        "sent": False,
+        "articles": articles,  # Preserved so a feedback re-run can reuse the same article pool
+    }
     print("      Cached successfully.", flush=True)
 
     # Step 4: Build preview HTML with reviewer banner and send
     print("\n[4/4] Building preview and sending to reviewer...", flush=True)
     approve_url = f"{webhook_url}?token={approval_token}"
+    decline_url = f"{decline_base_url}?token={approval_token}"
+    preview_url = f"{preview_base_url}?token={approval_token}"
     preview_banner = (
         '<div style="background-color:#e65100;color:white;padding:20px 30px;'
         'text-align:center;font-family:Arial,Helvetica,sans-serif;">'
-        '<p style="margin:0 0 8px 0;font-size:17px;font-weight:bold;">'
+        '<p style="margin:0 0 4px 0;font-size:17px;font-weight:bold;">'
         '&#9888; REVIEWER PREVIEW &mdash; Not yet sent to subscribers'
         '</p>'
+        '<p style="margin:0 0 4px 0;font-size:12px;opacity:0.85;">'
+        '<a href="' + preview_url + '" style="color:white;text-decoration:underline;">'
+        'View newsletter in browser &rarr;</a>'
+        '</p>'
         '<p style="margin:0 0 16px 0;font-size:14px;line-height:1.5;">'
-        'Review the newsletter below. Click the button to approve and send to all subscribers.'
+        'Review the newsletter below. Approve to send to all subscribers, '
+        'or request changes with feedback.'
         '</p>'
         '<a href="' + approve_url + '" '
         'style="display:inline-block;background-color:#2e7d32;color:white;'
         'padding:14px 32px;font-size:16px;font-weight:bold;text-decoration:none;'
-        'border-radius:4px;">&#10003; Approve &amp; Send to All Subscribers</a>'
+        'border-radius:4px;margin-right:12px;">&#10003; Approve &amp; Send to All Subscribers</a>'
+        '<a href="' + decline_url + '" '
+        'style="display:inline-block;background-color:#b71c1c;color:white;'
+        'padding:14px 32px;font-size:16px;font-weight:bold;text-decoration:none;'
+        'border-radius:4px;">&#10007; Request Changes</a>'
         '</div>'
     )
     preview_html = re.sub(r'(<body[^>]*>)', r'\1' + preview_banner, html_body, count=1)
 
     result = send_newsletter(
-        client_id=gmail_client_id,
-        client_secret=gmail_secret,
-        refresh_token=gmail_refresh,
-        sender_email=sender_email,
+        sender_email=gmail_sender,
+        app_password=gmail_password,
         recipient_emails=reviewer_emails,
         subject=f"[PREVIEW] {subject}",
         html_body=preview_html,
@@ -222,30 +284,50 @@ def approve_and_send(token: str = "") -> None:
             status_code=404,
         )
 
+    # Idempotency: prevent double-sends if the reviewer clicks the button more than once
+    if cached.get("sent"):
+        subject = cached.get("subject", "")
+        return HTMLResponse(
+            content=(
+                '<!DOCTYPE html><html><head><meta charset="UTF-8">'
+                '<title>Already Sent</title></head>'
+                '<body style="font-family:Arial,Helvetica,sans-serif;text-align:center;'
+                'padding:60px 20px;background:#f0f2f5;">'
+                '<div style="max-width:500px;margin:0 auto;background:white;padding:40px;'
+                'border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);">'
+                '<h1 style="color:#f57c00;margin-bottom:16px;">&#8505; Already Sent</h1>'
+                '<p style="font-size:15px;color:#555;margin-bottom:12px;">'
+                'This newsletter has already been sent to subscribers.</p>'
+                f'<p style="font-size:14px;color:#666;"><strong>Subject:</strong> {subject}</p>'
+                '</div></body></html>'
+            ),
+            status_code=200,
+        )
+
     html_body = cached["html"]
     subject   = cached["subject"]
 
-    gmail_client_id  = os.environ["GMAIL_CLIENT_ID"]
-    gmail_secret     = os.environ["GMAIL_CLIENT_SECRET"]
-    gmail_refresh    = os.environ["GMAIL_REFRESH_TOKEN"]
-    sender_email     = os.environ["GMAIL_SENDER_EMAIL"]
+    gmail_sender     = os.environ["GMAIL_SENDER_EMAIL"]
+    gmail_password   = os.environ["GMAIL_APP_PASSWORD"]
     recipient_emails = [r.strip() for r in os.environ["RECIPIENT_EMAILS"].split(",")]
 
-    print(f"Approval received. Sending to {len(recipient_emails)} recipient(s)...", flush=True)
+    print(f"Approval received. Sending to {len(recipient_emails)} recipient(s) via BCC...", flush=True)
 
     result = send_newsletter(
-        client_id=gmail_client_id,
-        client_secret=gmail_secret,
-        refresh_token=gmail_refresh,
-        sender_email=sender_email,
+        sender_email=gmail_sender,
+        app_password=gmail_password,
         recipient_emails=recipient_emails,
         subject=subject,
         html_body=html_body,
+        bcc=True,
     )
 
     msg_id = result.get("id", "unknown")
     n = len(recipient_emails)
     print(f"Newsletter sent! ID: {msg_id}. Recipients: {', '.join(recipient_emails)}", flush=True)
+
+    # Mark as sent to block duplicate sends
+    newsletter_cache["latest"] = {**cached, "sent": True}
 
     return HTMLResponse(content=(
         '<!DOCTYPE html><html><head><meta charset="UTF-8">'
@@ -260,6 +342,185 @@ def approve_and_send(token: str = "") -> None:
         f'<p style="font-size:12px;color:#999;">Message ID: {msg_id}</p>'
         '</div></body></html>'
     ))
+
+
+@app.function(
+    image=newsletter_image,
+    secrets=[newsletter_secrets],
+    timeout=120,
+)
+@modal.fastapi_endpoint(method="GET")
+def request_changes(token: str = "", comments: str = "") -> None:
+    """
+    Stage 2b: Decline the newsletter and optionally submit reviewer feedback.
+
+    GET with no comments → shows the feedback form.
+    GET with comments → stores feedback, triggers Stage 1 regeneration, confirms to reviewer.
+
+    The "Request Changes" button in the preview email points here with just the token.
+    The form on this page submits back to this same URL with the token + comments.
+    """
+    from fastapi.responses import HTMLResponse
+
+    approval_token = os.environ["APPROVAL_SECRET_TOKEN"]
+
+    if not token or token != approval_token:
+        return HTMLResponse(
+            content=(
+                '<!DOCTYPE html><html><head><meta charset="UTF-8">'
+                '<title>Unauthorized</title></head>'
+                '<body style="font-family:Arial,Helvetica,sans-serif;text-align:center;'
+                'padding:60px 20px;background:#f0f2f5;">'
+                '<div style="max-width:480px;margin:0 auto;background:white;padding:40px;'
+                'border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);">'
+                '<h1 style="color:#dc3545;margin-bottom:16px;">&#10060; Unauthorized</h1>'
+                '<p style="font-size:15px;color:#555;">Invalid or missing approval token.</p>'
+                '</div></body></html>'
+            ),
+            status_code=403,
+        )
+
+    MAX_REVISIONS = 3
+    revision_count = newsletter_cache.get("revision_count", 0)
+
+    if not comments.strip():
+        # Hit the revision cap — tell reviewer to contact admin instead of showing form
+        if revision_count >= MAX_REVISIONS:
+            return HTMLResponse(content=(
+                '<!DOCTYPE html><html><head><meta charset="UTF-8">'
+                '<title>Maximum Revisions Reached</title></head>'
+                '<body style="font-family:Arial,Helvetica,sans-serif;text-align:center;'
+                'padding:60px 20px;background:#f0f2f5;">'
+                '<div style="max-width:520px;margin:0 auto;background:white;padding:40px;'
+                'border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);">'
+                '<h1 style="color:#e65100;margin-bottom:16px;">&#9888; Maximum Revisions Reached</h1>'
+                f'<p style="font-size:15px;color:#555;margin-bottom:12px;">'
+                f'This newsletter has been revised {revision_count} time(s) already. '
+                f'Please approve the current version or contact the newsletter admin to '
+                f'trigger a fresh run next week.</p>'
+                '</div></body></html>'
+            ))
+
+        # Show the feedback form — action submits back to this same URL
+        form_action = f"?token={token}"
+        revisions_left = MAX_REVISIONS - revision_count
+        return HTMLResponse(content=(
+            '<!DOCTYPE html><html><head><meta charset="UTF-8">'
+            '<title>Request Newsletter Changes</title>'
+            '<style>'
+            'body{margin:0;padding:40px 16px;background:#f0f2f5;'
+            'font-family:Arial,Helvetica,sans-serif;}'
+            '.card{max-width:540px;margin:0 auto;background:white;padding:40px;'
+            'border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);}'
+            'h1{color:#b71c1c;margin:0 0 8px 0;font-size:22px;}'
+            'p{color:#555;font-size:14px;line-height:1.6;margin:0 0 20px 0;}'
+            '.quota{font-size:12px;color:#999;margin:0 0 16px 0;}'
+            'label{display:block;font-size:13px;font-weight:bold;color:#333;'
+            'margin-bottom:6px;}'
+            'textarea{width:100%;box-sizing:border-box;padding:12px;font-size:14px;'
+            'font-family:Arial,Helvetica,sans-serif;border:1px solid #ccc;'
+            'border-radius:4px;resize:vertical;min-height:140px;}'
+            'button{margin-top:16px;padding:14px 32px;background:#b71c1c;color:white;'
+            'font-size:15px;font-weight:bold;border:none;border-radius:4px;'
+            'cursor:pointer;width:100%;}'
+            'button:hover{background:#c62828;}'
+            '</style></head>'
+            '<body>'
+            '<div class="card">'
+            '<h1>&#10007; Request Changes</h1>'
+            '<p>Describe what you would like changed in the next version of the newsletter. '
+            'The newsletter will be regenerated using the same articles and a new preview '
+            'will be sent to you.</p>'
+            f'<p class="quota">Revisions remaining this week: <strong>{revisions_left} of {MAX_REVISIONS}</strong></p>'
+            f'<form method="GET" action="{form_action}">'
+            f'<input type="hidden" name="token" value="{token}" />'
+            '<label for="comments">Your feedback:</label>'
+            '<textarea id="comments" name="comments" placeholder="e.g. Focus more on enterprise AI adoption stories. The builders section needs more emphasis on revenue traction. Avoid including opinion pieces." required></textarea>'
+            '<button type="submit">&#8635; Submit &amp; Regenerate Newsletter</button>'
+            '</form>'
+            '</div></body></html>'
+        ))
+
+    # Feedback submitted — increment counter, store feedback, trigger regeneration
+    reviewer_comments = comments.strip()
+    newsletter_cache["revision_count"] = revision_count + 1
+    newsletter_cache["feedback"] = reviewer_comments
+    print(f"Reviewer requested changes (revision {revision_count + 1}/{MAX_REVISIONS}). "
+          f"Feedback: {reviewer_comments[:200]}", flush=True)
+
+    generate_and_preview.spawn()
+    print("Stage 1 regeneration spawned.", flush=True)
+
+    return HTMLResponse(content=(
+        '<!DOCTYPE html><html><head><meta charset="UTF-8">'
+        '<title>Regenerating Newsletter</title></head>'
+        '<body style="font-family:Arial,Helvetica,sans-serif;text-align:center;'
+        'padding:60px 20px;background:#f0f2f5;">'
+        '<div style="max-width:520px;margin:0 auto;background:white;padding:40px;'
+        'border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);">'
+        '<h1 style="color:#1565c0;margin-bottom:16px;">&#8635; Regenerating Newsletter</h1>'
+        '<p style="font-size:15px;color:#333;margin-bottom:12px;">'
+        'Your feedback has been received. A new newsletter is being generated now.</p>'
+        '<p style="font-size:14px;color:#555;margin-bottom:20px;line-height:1.6;">'
+        '<strong>Your feedback:</strong><br />'
+        f'<em style="color:#444;">{reviewer_comments}</em></p>'
+        '<p style="font-size:13px;color:#888;">'
+        'You will receive a new preview email shortly. This typically takes 2&ndash;3 minutes.</p>'
+        '</div></body></html>'
+    ))
+
+
+@app.function(
+    image=newsletter_image,
+    secrets=[newsletter_secrets],
+    timeout=30,
+)
+@modal.fastapi_endpoint(method="GET")
+def browser_preview(token: str = "") -> None:
+    """
+    Serves the cached newsletter HTML directly in a browser.
+    Linked from the "View in browser" link in the preview email banner.
+    Lets the reviewer see a canonical render independent of their email client.
+    """
+    from fastapi.responses import HTMLResponse
+
+    approval_token = os.environ["APPROVAL_SECRET_TOKEN"]
+
+    if not token or token != approval_token:
+        return HTMLResponse(
+            content=(
+                '<!DOCTYPE html><html><head><meta charset="UTF-8">'
+                '<title>Unauthorized</title></head>'
+                '<body style="font-family:Arial,Helvetica,sans-serif;text-align:center;'
+                'padding:60px 20px;background:#f0f2f5;">'
+                '<div style="max-width:480px;margin:0 auto;background:white;padding:40px;'
+                'border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);">'
+                '<h1 style="color:#dc3545;margin-bottom:16px;">&#10060; Unauthorized</h1>'
+                '<p style="font-size:15px;color:#555;">Invalid or missing approval token.</p>'
+                '</div></body></html>'
+            ),
+            status_code=403,
+        )
+
+    cached = newsletter_cache.get("latest")
+    if not cached:
+        return HTMLResponse(
+            content=(
+                '<!DOCTYPE html><html><head><meta charset="UTF-8">'
+                '<title>No Newsletter Found</title></head>'
+                '<body style="font-family:Arial,Helvetica,sans-serif;text-align:center;'
+                'padding:60px 20px;background:#f0f2f5;">'
+                '<div style="max-width:480px;margin:0 auto;background:white;padding:40px;'
+                'border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);">'
+                '<h1 style="color:#dc3545;margin-bottom:16px;">&#10060; No Newsletter Cached</h1>'
+                '<p style="font-size:15px;color:#555;">No newsletter is waiting for approval. '
+                'Has the preview (Stage 1) run yet this week?</p>'
+                '</div></body></html>'
+            ),
+            status_code=404,
+        )
+
+    return HTMLResponse(content=cached["html"])
 
 
 @app.local_entrypoint()
