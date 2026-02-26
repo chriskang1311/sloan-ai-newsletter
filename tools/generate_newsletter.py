@@ -21,7 +21,6 @@ Standalone test:
   python tools/generate_newsletter.py
 """
 
-import base64
 import json
 import os
 import re
@@ -29,18 +28,6 @@ import sys
 import time
 from datetime import datetime, timedelta
 from typing import TypedDict
-
-
-def _load_logo_base64(logo_path: str = "ai_club_logo.jpg") -> str:
-    """Loads the logo file and returns a base64 data URI for inline embedding."""
-    try:
-        with open(logo_path, "rb") as f:
-            data = base64.b64encode(f.read()).decode("utf-8")
-        ext = logo_path.rsplit(".", 1)[-1].lower()
-        mime = "image/jpeg" if ext in ("jpg", "jpeg") else f"image/{ext}"
-        return f"data:{mime};base64,{data}"
-    except FileNotFoundError:
-        return ""  # Falls back gracefully — no logo shown
 
 
 CLAUDE_MODEL = "claude-sonnet-4-5-20250929"
@@ -339,11 +326,12 @@ Return JSON:
     return subject_line, greeting_finish, story_teasers
 
 
-def build_html_email(content: NewsletterContent, logo_data_uri: str = "") -> str:
+def build_html_email(content: NewsletterContent) -> str:
     """
     Assembles the full HTML email from newsletter content.
     Table-based layout with inline CSS for Gmail compatibility.
-    logo_data_uri: base64 data URI string, or empty string to show no logo.
+    The logo is referenced as cid:logo and attached separately as a MIME part
+    by send_email.py — this keeps the HTML body small and avoids Gmail clipping.
     """
 
     def _render_story(story: dict, accent_color: str) -> str:
@@ -471,7 +459,7 @@ def build_html_email(content: NewsletterContent, logo_data_uri: str = "") -> str
           <!-- HEADER -->
           <tr>
             <td style="background-color: #1a1a2e; padding: 28px 30px 20px 30px; text-align: center;">
-              {f'<img src="{logo_data_uri}" alt="MIT Sloan AI Club" width="110" height="110" style="display: block; margin: 0 auto 12px auto; border-radius: 8px;" />' if logo_data_uri else ''}
+              <img src="cid:logo" alt="MIT Sloan AI Club" width="110" height="110" style="display: block; margin: 0 auto 12px auto; border-radius: 8px;" />
               <h1 style="margin: 0 0 4px 0; font-size: 20px; font-weight: bold; color: #ffffff; font-family: Arial, Helvetica, sans-serif;">
                 AI News for Sloanies
               </h1>
@@ -556,14 +544,13 @@ def build_html_email(content: NewsletterContent, logo_data_uri: str = "") -> str
 def generate_newsletter(
     anthropic_api_key: str,
     articles: list,
-    logo_path: str = "ai_club_logo.jpg",
     reviewer_feedback: str = "",
 ) -> tuple:
     """
     Main entry point. Orchestrates all Claude calls and builds the HTML email.
     Returns (html_string, subject_line).
-    logo_path: path to the logo file (relative or absolute).
     reviewer_feedback: optional feedback from a reviewer to guide regeneration.
+    The logo is NOT loaded here — it is attached as an inline MIME image by send_email.py.
     """
     try:
         import anthropic
@@ -572,11 +559,6 @@ def generate_newsletter(
 
     client = anthropic.Anthropic(api_key=anthropic_api_key)
     monday_date = _get_monday_date()
-    logo_data_uri = _load_logo_base64(logo_path)
-    if logo_data_uri:
-        print(f"  Logo loaded from {logo_path}", flush=True)
-    else:
-        print(f"  WARNING: Logo not found at '{logo_path}'. Header will show without logo.", flush=True)
 
     # Build effective system prompt — incorporate reviewer feedback when regenerating
     if reviewer_feedback:
@@ -621,7 +603,7 @@ def generate_newsletter(
     )
 
     print("Building HTML email...", flush=True)
-    html = build_html_email(content, logo_data_uri=logo_data_uri)
+    html = build_html_email(content)
 
     return html, subject_line
 

@@ -24,15 +24,17 @@ Two-stage pipeline with human-in-the-loop review:
 Setup:
   1. Install Modal: pip install modal
   2. Authenticate: modal token new
-  3. Create an App Password for Gmail (no custom domain required):
-       myaccount.google.com → Security → 2-Step Verification (enable if needed)
-       → App passwords → Mail / Other → Generate → copy the 16-char password
+  3. Set up Brevo SMTP relay for deliverability (prevents Outlook junk filtering):
+       a. Create a free account at brevo.com
+       b. Verify sender: Brevo dashboard → Senders & IPs → Senders → Add sender email
+       c. Get SMTP key: Brevo dashboard → Transactional → Email → SMTP & API → Generate key
   4. Create secrets in Modal dashboard:
      - Secret name: newsletter-secrets
      - Required keys:
          NEWSAPI_KEY, ANTHROPIC_API_KEY
-         GMAIL_SENDER_EMAIL     — your Gmail address (e.g. you@gmail.com)
-         GMAIL_APP_PASSWORD     — the 16-character App Password (no spaces)
+         GMAIL_SENDER_EMAIL     — the verified From address (e.g. mitsloanaiclub@gmail.com)
+         BREVO_SMTP_LOGIN       — the email you use to log into Brevo
+         BREVO_SMTP_KEY         — the SMTP key from Brevo dashboard
          RECIPIENT_EMAILS       — comma-separated subscriber list
          REVIEWER_EMAILS        — comma-separated reviewer list
          APPROVAL_SECRET_TOKEN  — any long random string (acts as a shared secret for button links)
@@ -110,7 +112,8 @@ def generate_and_preview() -> None:
     newsapi_key      = os.environ["NEWSAPI_KEY"]
     anthropic_key    = os.environ["ANTHROPIC_API_KEY"]
     gmail_sender     = os.environ["GMAIL_SENDER_EMAIL"]
-    gmail_password   = os.environ["GMAIL_APP_PASSWORD"]
+    smtp_password    = os.environ["BREVO_SMTP_KEY"]
+    smtp_login       = os.environ["BREVO_SMTP_LOGIN"]
     reviewer_emails  = [r.strip() for r in os.environ["REVIEWER_EMAILS"].split(",")]
     webhook_url      = os.environ["WEBHOOK_URL"]
     approval_token   = os.environ["APPROVAL_SECRET_TOKEN"]
@@ -165,7 +168,6 @@ def generate_and_preview() -> None:
     html_body, subject = generate_newsletter(
         anthropic_api_key=anthropic_key,
         articles=articles,
-        logo_path="/app/ai_club_logo.jpg",
         reviewer_feedback=reviewer_feedback,
     )
     print(f"      Newsletter generated ({len(html_body):,} bytes of HTML).", flush=True)
@@ -212,12 +214,17 @@ def generate_and_preview() -> None:
     )
     preview_html = re.sub(r'(<body[^>]*>)', r'\1' + preview_banner, html_body, count=1)
 
+    with open("/app/ai_club_logo.jpg", "rb") as f:
+        logo_bytes = f.read()
+
     result = send_newsletter(
         sender_email=gmail_sender,
-        app_password=gmail_password,
+        smtp_password=smtp_password,
+        smtp_login=smtp_login,
         recipient_emails=reviewer_emails,
         subject=f"[PREVIEW] {subject}",
         html_body=preview_html,
+        inline_images={"logo": logo_bytes},
     )
 
     print(f"\n{'=' * 55}", flush=True)
@@ -235,20 +242,16 @@ def generate_and_preview() -> None:
 @modal.fastapi_endpoint(method="GET")
 def approve_and_send(token: str = "") -> None:
     """
-    Stage 2: Approve and send newsletter to all subscribers.
-    Triggered when the reviewer clicks the "Approve & Send" button in the preview email.
+    Stage 2a (GET): Reviewer clicks "Approve" in the preview email.
 
-    Validates the token, retrieves the cached newsletter, sends to RECIPIENT_EMAILS,
-    and returns an HTML confirmation page.
+    Shows a confirmation page — does NOT send the newsletter. This prevents email clients
+    (Outlook SafeLinks, Gmail link-scanner) from accidentally triggering a send when they
+    pre-fetch URLs in the preview email. The actual send happens in confirm_and_send (POST).
     """
-    sys.path.insert(0, "/app")
-
-    from tools.send_email import send_newsletter
     from fastapi.responses import HTMLResponse
 
     approval_token = os.environ["APPROVAL_SECRET_TOKEN"]
 
-    # Security: validate token
     if not token or token != approval_token:
         return HTMLResponse(
             content=(
@@ -265,7 +268,6 @@ def approve_and_send(token: str = "") -> None:
             status_code=403,
         )
 
-    # Retrieve cached newsletter
     cached = newsletter_cache.get("latest")
     if not cached:
         return HTMLResponse(
@@ -284,7 +286,102 @@ def approve_and_send(token: str = "") -> None:
             status_code=404,
         )
 
-    # Idempotency: prevent double-sends if the reviewer clicks the button more than once
+    if cached.get("sent"):
+        subject = cached.get("subject", "")
+        return HTMLResponse(
+            content=(
+                '<!DOCTYPE html><html><head><meta charset="UTF-8">'
+                '<title>Already Sent</title></head>'
+                '<body style="font-family:Arial,Helvetica,sans-serif;text-align:center;'
+                'padding:60px 20px;background:#f0f2f5;">'
+                '<div style="max-width:500px;margin:0 auto;background:white;padding:40px;'
+                'border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);">'
+                '<h1 style="color:#f57c00;margin-bottom:16px;">&#8505; Already Sent</h1>'
+                '<p style="font-size:15px;color:#555;margin-bottom:12px;">'
+                'This newsletter has already been sent to subscribers.</p>'
+                f'<p style="font-size:14px;color:#666;"><strong>Subject:</strong> {subject}</p>'
+                '</div></body></html>'
+            ),
+            status_code=200,
+        )
+
+    subject = cached["subject"]
+    n = len([r for r in os.environ["RECIPIENT_EMAILS"].split(",") if r.strip()])
+    confirm_url = os.environ["WEBHOOK_URL"].replace("approve-and-send", "confirm-and-send")
+
+    return HTMLResponse(content=(
+        '<!DOCTYPE html><html><head><meta charset="UTF-8">'
+        '<title>Confirm Send</title></head>'
+        '<body style="font-family:Arial,Helvetica,sans-serif;text-align:center;'
+        'padding:60px 20px;background:#f0f2f5;">'
+        '<div style="max-width:520px;margin:0 auto;background:white;padding:40px;'
+        'border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);">'
+        '<h1 style="color:#1a1a2e;margin-bottom:12px;">&#9993; Ready to Send</h1>'
+        f'<p style="font-size:15px;color:#333;margin-bottom:6px;"><strong>Subject:</strong> {subject}</p>'
+        f'<p style="font-size:15px;color:#555;margin-bottom:28px;">This will send to <strong>{n}</strong> subscriber(s). This action cannot be undone.</p>'
+        f'<a href="{confirm_url}?token={token}" '
+        'style="display:inline-block;background-color:#2e7d32;color:white;'
+        'padding:16px 40px;font-size:17px;font-weight:bold;text-decoration:none;'
+        'border-radius:4px;">&#10003; Yes, Send to All Subscribers</a>'
+        '<p style="margin-top:20px;font-size:12px;color:#aaa;">This link only appears in your browser — email clients cannot trigger it.</p>'
+        '</div></body></html>'
+    ))
+
+
+@app.function(
+    image=newsletter_image,
+    secrets=[newsletter_secrets],
+    timeout=120,
+)
+@modal.fastapi_endpoint(method="GET")
+def confirm_and_send(token: str = "") -> None:
+    """
+    Stage 2b (GET): Actually sends the newsletter to all subscribers.
+    Triggered by the reviewer clicking "Yes, Send" on the confirmation page from approve_and_send.
+    This URL is only ever shown in the browser (never in an email), so email client
+    pre-fetchers cannot reach it.
+    """
+    sys.path.insert(0, "/app")
+
+    from tools.send_email import send_newsletter
+    from fastapi.responses import HTMLResponse
+
+    approval_token = os.environ["APPROVAL_SECRET_TOKEN"]
+
+    if not token or token != approval_token:
+        return HTMLResponse(
+            content=(
+                '<!DOCTYPE html><html><head><meta charset="UTF-8">'
+                '<title>Unauthorized</title></head>'
+                '<body style="font-family:Arial,Helvetica,sans-serif;text-align:center;'
+                'padding:60px 20px;background:#f0f2f5;">'
+                '<div style="max-width:480px;margin:0 auto;background:white;padding:40px;'
+                'border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);">'
+                '<h1 style="color:#dc3545;margin-bottom:16px;">&#10060; Unauthorized</h1>'
+                '<p style="font-size:15px;color:#555;">Invalid or missing approval token.</p>'
+                '</div></body></html>'
+            ),
+            status_code=403,
+        )
+
+    cached = newsletter_cache.get("latest")
+    if not cached:
+        return HTMLResponse(
+            content=(
+                '<!DOCTYPE html><html><head><meta charset="UTF-8">'
+                '<title>No Newsletter Found</title></head>'
+                '<body style="font-family:Arial,Helvetica,sans-serif;text-align:center;'
+                'padding:60px 20px;background:#f0f2f5;">'
+                '<div style="max-width:480px;margin:0 auto;background:white;padding:40px;'
+                'border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);">'
+                '<h1 style="color:#dc3545;margin-bottom:16px;">&#10060; No Newsletter Cached</h1>'
+                '<p style="font-size:15px;color:#555;">No newsletter is waiting for approval.</p>'
+                '</div></body></html>'
+            ),
+            status_code=404,
+        )
+
+    # Idempotency guard
     if cached.get("sent"):
         subject = cached.get("subject", "")
         return HTMLResponse(
@@ -308,25 +405,30 @@ def approve_and_send(token: str = "") -> None:
     subject   = cached["subject"]
 
     gmail_sender     = os.environ["GMAIL_SENDER_EMAIL"]
-    gmail_password   = os.environ["GMAIL_APP_PASSWORD"]
+    smtp_password    = os.environ["BREVO_SMTP_KEY"]
+    smtp_login       = os.environ["BREVO_SMTP_LOGIN"]
     recipient_emails = [r.strip() for r in os.environ["RECIPIENT_EMAILS"].split(",")]
+    n = len(recipient_emails)
 
-    print(f"Approval received. Sending to {len(recipient_emails)} recipient(s) via BCC...", flush=True)
+    print(f"Approval confirmed. Sending to {n} recipient(s) via BCC...", flush=True)
+
+    with open("/app/ai_club_logo.jpg", "rb") as f:
+        logo_bytes = f.read()
 
     result = send_newsletter(
         sender_email=gmail_sender,
-        app_password=gmail_password,
+        smtp_password=smtp_password,
+        smtp_login=smtp_login,
         recipient_emails=recipient_emails,
         subject=subject,
         html_body=html_body,
         bcc=True,
+        inline_images={"logo": logo_bytes},
     )
 
     msg_id = result.get("id", "unknown")
-    n = len(recipient_emails)
     print(f"Newsletter sent! ID: {msg_id}. Recipients: {', '.join(recipient_emails)}", flush=True)
 
-    # Mark as sent to block duplicate sends
     newsletter_cache["latest"] = {**cached, "sent": True}
 
     return HTMLResponse(content=(
