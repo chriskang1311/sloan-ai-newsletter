@@ -57,6 +57,15 @@ import sys
 
 import modal
 
+# fastapi.Request is needed as a type annotation in send_confirmed so FastAPI injects
+# the request object rather than treating `request` as a query parameter.
+# fastapi is not installed locally, so we guard with try/except — in the container
+# (where fastapi IS installed) the real class is used; locally it falls back to None.
+try:
+    from fastapi import Request as _FastAPIRequest
+except ImportError:
+    _FastAPIRequest = None  # type: ignore[assignment,misc]
+
 app = modal.App("sloan-ai-newsletter")
 
 # Persistent Dict — stores the latest generated newsletter between Stage 1 and Stage 2.
@@ -71,7 +80,9 @@ newsletter_image = (
         "requests>=2.31.0",
         "feedparser>=6.0.11",
         "python-dateutil>=2.9.0",
-        "fastapi>=0.100.0",   # Required for web endpoint HTML responses
+        "fastapi>=0.100.0",        # Required for web endpoint HTML responses
+        "python-multipart>=0.0.9", # Required for await request.form() (POST form parsing)
+        "Pillow>=10.0.0",          # Required for logo compression (prevents Gmail clipping)
     ])
     # Mount the tools directory into the container
     .add_local_dir("tools", remote_path="/app/tools")
@@ -230,25 +241,22 @@ def generate_and_preview() -> None:
 @app.function(
     image=newsletter_image,
     secrets=[newsletter_secrets],
-    timeout=120,
+    timeout=30,
 )
 @modal.fastapi_endpoint(method="GET")
 def approve_and_send(token: str = "") -> None:
     """
-    Stage 2: Approve and send newsletter to all subscribers.
-    Triggered when the reviewer clicks the "Approve & Send" button in the preview email.
+    Stage 2a: Show confirmation page to reviewer.
+    Triggered when the reviewer clicks "Approve & Send" in the preview email.
 
-    Validates the token, retrieves the cached newsletter, sends to RECIPIENT_EMAILS,
-    and returns an HTML confirmation page.
+    This endpoint ONLY shows a confirmation form — it never sends anything.
+    The actual send happens in send_confirmed (POST), which email link scanners
+    cannot trigger because they only follow GET links, not POST form submissions.
     """
-    sys.path.insert(0, "/app")
-
-    from tools.send_email import send_newsletter
     from fastapi.responses import HTMLResponse
 
     approval_token = os.environ["APPROVAL_SECRET_TOKEN"]
 
-    # Security: validate token
     if not token or token != approval_token:
         return HTMLResponse(
             content=(
@@ -265,7 +273,79 @@ def approve_and_send(token: str = "") -> None:
             status_code=403,
         )
 
-    # Retrieve cached newsletter
+    webhook_url      = os.environ["WEBHOOK_URL"]
+    send_confirmed_url = webhook_url.replace("approve-and-send", "send-confirmed")
+    recipient_emails = [r.strip() for r in os.environ["RECIPIENT_EMAILS"].split(",")]
+    n = len(recipient_emails)
+    cached_check = newsletter_cache.get("latest", {})
+    subject_preview = cached_check.get("subject", "this week's newsletter")
+
+    # Confirmation page — uses a POST form so link scanners cannot trigger the send.
+    return HTMLResponse(content=(
+        '<!DOCTYPE html><html><head><meta charset="UTF-8">'
+        '<title>Confirm Send</title></head>'
+        '<body style="font-family:Arial,Helvetica,sans-serif;text-align:center;'
+        'padding:60px 20px;background:#f0f2f5;">'
+        '<div style="max-width:520px;margin:0 auto;background:white;padding:40px;'
+        'border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);">'
+        '<h1 style="color:#1565c0;margin-bottom:16px;">&#9993; Confirm Send</h1>'
+        f'<p style="font-size:15px;color:#333;margin-bottom:8px;">'
+        f'You are about to send the newsletter to <strong>{n} subscriber(s)</strong>.</p>'
+        f'<p style="font-size:14px;color:#666;margin-bottom:28px;">'
+        f'<strong>Subject:</strong> {subject_preview}</p>'
+        f'<form method="POST" action="{send_confirmed_url}">'
+        f'<input type="hidden" name="token" value="{token}" />'
+        '<button type="submit" '
+        'style="background-color:#2e7d32;color:white;border:none;cursor:pointer;'
+        'padding:16px 36px;font-size:16px;font-weight:bold;border-radius:4px;">'
+        '&#10003; Yes, Send to All Subscribers'
+        '</button>'
+        '</form>'
+        '<p style="margin-top:20px;font-size:12px;color:#aaa;">'
+        'This action cannot be undone.</p>'
+        '</div></body></html>'
+    ))
+
+
+@app.function(
+    image=newsletter_image,
+    secrets=[newsletter_secrets],
+    timeout=120,
+)
+@modal.fastapi_endpoint(method="POST")
+async def send_confirmed(request: _FastAPIRequest) -> None:
+    """
+    Stage 2b: Actually send the newsletter to all subscribers.
+    Triggered only by a POST form submission from the approve_and_send confirmation page.
+
+    POST-only — email link scanners follow GET links but never submit POST forms,
+    so this endpoint cannot be accidentally triggered by Gmail prefetching.
+    """
+    sys.path.insert(0, "/app")
+
+    from fastapi.responses import HTMLResponse
+    from tools.send_email import send_newsletter
+
+    form = await request.form()
+    token = str(form.get("token", ""))
+    approval_token = os.environ["APPROVAL_SECRET_TOKEN"]
+
+    if not token or token != approval_token:
+        return HTMLResponse(
+            content=(
+                '<!DOCTYPE html><html><head><meta charset="UTF-8">'
+                '<title>Unauthorized</title></head>'
+                '<body style="font-family:Arial,Helvetica,sans-serif;text-align:center;'
+                'padding:60px 20px;background:#f0f2f5;">'
+                '<div style="max-width:480px;margin:0 auto;background:white;padding:40px;'
+                'border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);">'
+                '<h1 style="color:#dc3545;margin-bottom:16px;">&#10060; Unauthorized</h1>'
+                '<p style="font-size:15px;color:#555;">Invalid or missing approval token.</p>'
+                '</div></body></html>'
+            ),
+            status_code=403,
+        )
+
     cached = newsletter_cache.get("latest")
     if not cached:
         return HTMLResponse(
@@ -284,7 +364,7 @@ def approve_and_send(token: str = "") -> None:
             status_code=404,
         )
 
-    # Idempotency: prevent double-sends if the reviewer clicks the button more than once
+    # Idempotency: prevent double-sends
     if cached.get("sent"):
         subject = cached.get("subject", "")
         return HTMLResponse(
@@ -380,7 +460,7 @@ def request_changes(token: str = "", comments: str = "") -> None:
             status_code=403,
         )
 
-    MAX_REVISIONS = 3
+    MAX_REVISIONS = 10
     revision_count = newsletter_cache.get("revision_count", 0)
 
     if not comments.strip():

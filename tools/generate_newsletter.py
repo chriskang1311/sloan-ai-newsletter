@@ -32,13 +32,21 @@ from typing import TypedDict
 
 
 def _load_logo_base64(logo_path: str = "ai_club_logo.jpg") -> str:
-    """Loads the logo file and returns a base64 data URI for inline embedding."""
+    """
+    Loads the logo, resizes it to 110x110px, and returns a compressed base64 data URI.
+    Compression is critical: Gmail clips emails over ~102KB, and a raw 200KB+ logo
+    would push the HTML well over that limit. A 110x110 JPEG at quality 40 is ~5-8KB.
+    """
     try:
-        with open(logo_path, "rb") as f:
-            data = base64.b64encode(f.read()).decode("utf-8")
-        ext = logo_path.rsplit(".", 1)[-1].lower()
-        mime = "image/jpeg" if ext in ("jpg", "jpeg") else f"image/{ext}"
-        return f"data:{mime};base64,{data}"
+        import io
+        from PIL import Image
+        with Image.open(logo_path) as img:
+            img = img.convert("RGB")
+            img = img.resize((110, 110), Image.LANCZOS)
+            buffer = io.BytesIO()
+            img.save(buffer, format="JPEG", quality=40, optimize=True)
+            data = base64.b64encode(buffer.getvalue()).decode("utf-8")
+        return f"data:image/jpeg;base64,{data}"
     except FileNotFoundError:
         return ""  # Falls back gracefully — no logo shown
 
